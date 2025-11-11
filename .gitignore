@@ -1,4 +1,61 @@
-venv/
-.Whales_and_Price/
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.pyo
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-wheel-metadata/
+
+# --- Environments ---
+.env
+.venv
 env/
+venv/
 ENV/
+.WhalesMoves/
+.ipynb_checkpoints/
+*.ipynb_checkpoints/
+
+# --- IDE & Editors ---
+.vscode/
+.idea/
+*.code-workspace
+
+# --- OS / System files ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Logs & Cache ---
+*.log
+*.tmp
+*.swp
+*.bak
+.cache/
+logs/
+
+# --- Jupyter Notebook Checkpoints ---
+.ipynb_checkpoints/
+
+# --- Data files (optional, uncomment if you save local data)
+# data/
+# outputs/
+# results/
+# .csv
+# .xlsx
+# .parquet
+
+# --- Credentials ---
+*.key
+*.pem
+*.json
+*.pkl
+
+# --- Other ---
+*.sqlite3
+*.db
