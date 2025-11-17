@@ -33,7 +33,7 @@ warnings.filterwarnings('ignore')
 class ETHPricePredictor:
     """Train and save ETH price direction predictor"""
     
-    def __init__(self, data_file='Whales_and_Price/whale_prices_ml_ready.csv', model_file='models/best_model.pkl'):
+    def __init__(self, data_file='whale_prices_ml_ready.csv', model_file='models/best_model.pkl'):
         self.data_file = data_file
         self.model_file = model_file
         self.model = None
@@ -340,7 +340,7 @@ class ETHPricePredictor:
 def main():
     """Main training function"""
     trainer = ETHPricePredictor(
-        data_file='Whales_and_Price/whale_prices_ml_ready.csv',
+        data_file='whale_prices_ml_ready.csv',
         model_file='models/best_model.pkl'
     )
     trainer.train()

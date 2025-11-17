@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  eth-predictor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: eth-whale-predictor
+    ports:
+      - "9696:9696"
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./models:/app/models:ro
+      - ./whale_prices_ml_ready.csv:/app/whale_prices_ml_ready.csv:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:9696/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - predictor-network
+
+networks:
+  predictor-network:
+    driver: bridge

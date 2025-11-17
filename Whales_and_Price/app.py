@@ -1,5 +1,5 @@
 """
-app.py - ETH Whale Activity Price Predictor API
+app.py - ETH Whale Activity Price Direction Predictor API
 
 FastAPI web service for making predictions on whale data.
 
@@ -26,8 +26,8 @@ warnings.filterwarnings('ignore')
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="ETH Whale Activity Price Predictor API",
-    description="Predict ETH price movements based on whale activity",
+    title="ETH Whale Activity Price Direction Predictor API",
+    description="Predict ETH price movements (up or Down) based on whale activity",
     version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
