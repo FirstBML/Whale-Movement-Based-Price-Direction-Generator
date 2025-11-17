@@ -1,0 +1,20 @@
+{
+  "name": "Whales ML – Docker Enabled",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-azuretools.vscode-docker"
+      ]
+    }
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {}
+  },
+  "forwardPorts": [9696],
+  "postCreateCommand": "python --version && pip --version",
+  "remoteUser": "vscode"
+}
