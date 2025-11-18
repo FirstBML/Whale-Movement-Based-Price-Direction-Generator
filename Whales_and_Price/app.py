@@ -5,8 +5,8 @@ Updated to:
  - Stream refresh progress via Server-Sent Events (SSE)
  - Use APIKeyHeader for OpenAPI/Swagger admin input (shows lock)
  - Home page is a dashboard-style UI served as a static string (no f-strings)
- - Admin modal calls the SSE stream and displays live progress; password input remains masked
- - `refresh_data_and_predict` accepts an optional progress callback for fine-grained updates
+ - Admin modal calls the SSE stream and displays live progress
+ - PASSWORD VISIBILITY TOGGLE and DEBUG LOGGING added
 
 Usage:
     uvicorn app:app --host 0.0.0.0 --port 9696
@@ -124,7 +124,16 @@ def verify_admin_key_query(admin_key: Optional[str] = Query(None, alias='admin_k
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Admin authentication not configured on server"
         )
-    if not admin_key or not secrets.compare_digest(admin_key, ADMIN_API_KEY):
+    if not admin_key:
+        print(f"❌ No admin_key provided in query")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing admin API key")
+    
+    # Debug logging
+    print(f"🔐 Received admin_key: '{admin_key}'")
+    print(f"🔐 Expected admin_key: '{ADMIN_API_KEY}'")
+    print(f"🔐 Keys match: {secrets.compare_digest(admin_key, ADMIN_API_KEY)}")
+    
+    if not secrets.compare_digest(admin_key, ADMIN_API_KEY):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid admin API key")
     return True
 
@@ -434,6 +443,7 @@ async def startup_event():
         print("⚠️  ADMIN_API_KEY not set - refresh endpoint will be disabled")
     else:
         print("✅ Admin authentication configured")
+        print(f"🔐 Admin key set to: {ADMIN_API_KEY[:10]}..." if len(ADMIN_API_KEY) > 10 else f"🔐 Admin key: {ADMIN_API_KEY}")
 
     model_loaded = load_model()
     if not model_loaded:
@@ -445,7 +455,6 @@ async def startup_event():
 
     if not cache_loaded or not data_loaded:
         print("\n🔄 No cache found. Running initial data refresh...")
-        # Run inline to ensure cache exists on startup
         refresh_data_and_predict()
     else:
         cache_date = datetime.fromisoformat(CACHED_PREDICTION['generated_at']).date()
@@ -462,11 +471,8 @@ async def startup_event():
 # ==================== API ENDPOINTS ====================
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    """Home page with in-page fetches and SSE-driven refresh UI (static HTML)
-    This function returns a static HTML string (no f-strings) to avoid syntax errors
-    caused by `{` and `}` inside JavaScript.
-    """
-    docs = """
+    """Home page with password visibility toggle and debugging"""
+    html = """
     <!doctype html>
     <html lang="en">
     <head>
@@ -486,9 +492,11 @@ async def home():
         .btn-primary { background:#0b74ff; color:white; }
         .btn-ghost { background:#eef2ff; color:#0b74ff; }
         .btn-danger { background:#dc3545; color:white; }
-        #progressBox { background:#0b1220; color:#7ef9a3; padding:12px; height:220px; overflow:auto; font-family:monospace; border-radius:8px; }
+        #progressBox { background:#0b1220; color:#7ef9a3; padding:12px; height:220px; overflow:auto; font-family:monospace; border-radius:8px; font-size:12px; }
         pre { white-space:pre-wrap; word-break:break-word; background:#f8fafc; padding:12px; border-radius:6px; }
         .cards-col { display:grid; gap:12px; }
+        .input-wrapper { position:relative; }
+        .toggle-btn { position:absolute; right:8px; top:50%; transform:translateY(-50%); padding:4px 8px; font-size:11px; background:#f0f0f0; border:1px solid #ccc; cursor:pointer; border-radius:4px; }
       </style>
     </head>
     <body>
@@ -552,14 +560,17 @@ async def home():
                 <form onsubmit="startStreamRefresh(event)">
                     <div style="margin-bottom:12px;">
                         <label for="adminKey"><strong>Admin API Key</strong></label>
-                        <input id="adminKey" name="adminKey" type="password" placeholder="Enter admin key" style="width:100%; padding:8px; margin-top:6px;" required autocomplete="off" />
+                        <div class="input-wrapper">
+                            <input id="adminKey" name="adminKey" type="password" placeholder="Enter admin key" style="width:100%; padding:8px; margin-top:6px; padding-right:80px; box-sizing:border-box;" required autocomplete="off" />
+                            <button type="button" onclick="togglePasswordVisibility()" class="toggle-btn" id="toggleBtn">Show</button>
+                        </div>
                     </div>
                     <div style="text-align:right;">
                         <button type="button" onclick="closeAdminModal()" style="margin-right:8px; padding:8px 12px;">Cancel</button>
                         <button type="submit" id="refreshBtn" style="background:#dc3545; color:white; padding:8px 12px;">🔄 Start Refresh (Stream)</button>
                     </div>
                 </form>
-                <p style="font-size:12px; color:#666; margin-top:12px;">Note: For the stream we pass the key as a query param (EventSource cannot set headers). This is intended for local/admin UIs only.</p>
+                <p style="font-size:12px; color:#666; margin-top:12px;">💡 Tip: Click "Show" to verify your password before submitting</p>
             </div>
         </div>
 
@@ -570,9 +581,25 @@ async def home():
             document.getElementById('adminModal').style.display='block';
             document.getElementById('adminKey').focus();
         }
+        
         function closeAdminModal(){
             document.getElementById('adminModal').style.display='none';
             document.getElementById('adminKey').value='';
+            const input = document.getElementById('adminKey');
+            input.type = 'password';
+            document.getElementById('toggleBtn').textContent = 'Show';
+        }
+        
+        function togglePasswordVisibility(){
+            const input = document.getElementById('adminKey');
+            const btn = document.getElementById('toggleBtn');
+            if(input.type === 'password'){
+                input.type = 'text';
+                btn.textContent = 'Hide';
+            } else {
+                input.type = 'password';
+                btn.textContent = 'Show';
+            }
         }
 
         async function loadPrediction(){
@@ -608,21 +635,30 @@ async def home():
             }catch(err){ card.innerHTML = '<pre style="color:red">' + err.message + '</pre>'; }
         }
 
-        // Start SSE refresh stream
+        // Start SSE refresh stream with debugging
         function startStreamRefresh(e){
             e.preventDefault();
             const adminKey = document.getElementById('adminKey').value;
             if(!adminKey) return alert('Admin key required');
+
+            // Debug logging
+            console.log('=== ADMIN KEY DEBUG ===');
+            console.log('Raw admin key:', adminKey);
+            console.log('Admin key length:', adminKey.length);
+            console.log('Encoded admin key:', encodeURIComponent(adminKey));
+            console.log('Full URL:', '/refresh/stream?admin_key=' + encodeURIComponent(adminKey));
+            console.log('=====================');
 
             const btn = document.getElementById('refreshBtn');
             btn.disabled = true;
             btn.textContent = '⏳ Starting...';
 
             const box = document.getElementById('progressBox');
-            box.innerHTML = '';
+            box.innerHTML = '<div>🔐 Authenticating...</div>';
 
             // Use EventSource with admin_key query param
-            const src = new EventSource('/refresh/stream?admin_key=' + encodeURIComponent(adminKey));
+            const url = '/refresh/stream?admin_key=' + encodeURIComponent(adminKey);
+            const src = new EventSource(url);
 
             src.onmessage = function(ev){
                 const line = document.createElement('div');
@@ -638,8 +674,13 @@ async def home():
             }
 
             src.onerror = function(ev){
+                const line = document.createElement('div');
+                line.style.color = '#ff6b6b';
+                line.textContent = '❌ Connection error - check console and server logs';
+                box.appendChild(line);
                 btn.disabled = false;
                 btn.textContent = '🔄 Start Refresh (Stream)';
+                console.error('EventSource error:', ev);
                 try{ src.close(); }catch(e){}
             }
 
@@ -649,7 +690,7 @@ async def home():
     </body>
     </html>
     """
-    return HTMLResponse(content=docs)
+    return HTMLResponse(content=html)
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -759,11 +800,11 @@ async def refresh_stream(admin_ok: bool = Depends(verify_admin_key_query)):
             for m in messages:
                 yield "data: " + str(m) + "\n\n"
             if success:
-                yield "data: Refresh completed successfully.\n\n"
+                yield "data: ✅ Refresh completed successfully.\n\n"
             else:
-                yield "data: Refresh failed (see server logs).\n\n"
+                yield "data: ❌ Refresh failed (see server logs).\n\n"
         except Exception as e:
-            yield "data: Exception during refresh: " + str(e) + "\n\n"
+            yield "data: ❌ Exception during refresh: " + str(e) + "\n\n"
         # finally close the stream
         yield "data: __STREAM_DONE__\n\n"
 
@@ -782,7 +823,13 @@ async def prediction_history(limit: int = 30, days: int = 30):
         cutoff_date = datetime.utcnow() - timedelta(days=days)
 
         if 'block_date' in DATA_DF.columns:
-            recent_df = DATA_DF[DATA_DF['block_date'] >= cutoff_date].copy()
+            # Ensure both sides of comparison are datetime objects
+            # Convert cutoff_date to date if block_date is date, or ensure block_date is datetime
+            if pd.api.types.is_datetime64_any_dtype(DATA_DF['block_date']):
+                recent_df = DATA_DF[DATA_DF['block_date'] >= cutoff_date].copy()
+            else:
+                # If block_date is date type, compare with date
+                recent_df = DATA_DF[DATA_DF['block_date'] >= cutoff_date.date()].copy()
         else:
             recent_df = DATA_DF.tail(limit).copy()
 
@@ -831,6 +878,8 @@ if __name__ == '__main__':
 
     if not ADMIN_API_KEY:
         print("⚠️  WARNING: ADMIN_API_KEY not set - refresh endpoint disabled")
+    else:
+        print(f"✅ Admin key configured: {ADMIN_API_KEY[:10]}..." if len(ADMIN_API_KEY) > 10 else f"✅ Admin key: {ADMIN_API_KEY}")
 
     print(f"\n💡 Press Ctrl+C to stop\n")
 
