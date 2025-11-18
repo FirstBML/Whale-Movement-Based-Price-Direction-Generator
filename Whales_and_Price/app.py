@@ -1,34 +1,40 @@
 """
-app.py - ETH Whale Activity Price Direction Predictor API
+app.py - ETH Whale Activity Price Predictor API with Auto-Refresh
 
-FastAPI web service for making predictions on whale data.
+FastAPI web service with automated daily data fetching and prediction caching.
 
 Usage:
     uvicorn app:app --host 0.0.0.0 --port 9696
-
-The service will start on http://localhost:9696
-API docs will be available at http://localhost:9696/docs
 """
 
+import os
 import pickle
 import warnings
-from datetime import datetime
-from typing import Optional, List
+import json
+import secrets
+from datetime import datetime, timedelta
+from typing import Optional
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException, status, Query
+from fastapi import FastAPI, HTTPException, status, BackgroundTasks, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
+from typing import List
+from apscheduler.schedulers.background import BackgroundScheduler
+
+# Import our data pipeline
+from data_pipeline import fetch_and_prepare_data
 
 warnings.filterwarnings('ignore')
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="ETH Whale Activity Price Direction Predictor API",
-    description="Predict ETH price movements (up or Down) based on whale activity",
-    version="2.0.0",
+    title="ETH Whale Activity Price Predictor API",
+    description="Predict ETH price movements with automated daily data refresh",
+    version="3.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -48,13 +54,48 @@ SCALER = None
 FEATURE_NAMES = None
 MODEL_INFO = None
 DATA_DF = None
+CACHED_PREDICTION = None
+LAST_UPDATE = None
+
+# File paths
 MODEL_FILE = 'models/best_model.pkl'
 DATA_FILE = 'whale_prices_ml_ready.csv'
+CACHE_FILE = 'prediction_cache.json'
+
+# Admin authentication
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
 
 
-# Pydantic models
+# ==================== AUTHENTICATION ====================
+
+def verify_admin_key(x_admin_key: str = Header(..., alias="x-admin-key")):
+    """
+    Verify admin API key with secure comparison
+    
+    Args:
+        x_admin_key: Admin API key from request header
+        
+    Raises:
+        HTTPException: If key is invalid or not configured
+    """
+    if not ADMIN_API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Admin authentication not configured on server"
+        )
+    
+    # Use constant-time comparison to prevent timing attacks
+    if not secrets.compare_digest(x_admin_key, ADMIN_API_KEY):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid admin API key"
+        )
+    return True
+
+
+# ==================== PYDANTIC MODELS ====================
+
 class HealthResponse(BaseModel):
-    """Health check response"""
     status: str
     model: Optional[str] = None
     trained_date: Optional[str] = None
@@ -62,10 +103,12 @@ class HealthResponse(BaseModel):
     data_loaded: bool
     latest_data_date: Optional[str] = None
     total_records: Optional[int] = None
+    last_update: Optional[str] = None
+    next_update: Optional[str] = None
+    cache_available: bool
 
 
 class ModelInfoResponse(BaseModel):
-    """Model information response"""
     model_name: str
     trained_date: str
     test_accuracy: Optional[float]
@@ -75,27 +118,36 @@ class ModelInfoResponse(BaseModel):
 
 
 class KeyMetrics(BaseModel):
-    """Key whale metrics"""
     net_exchange_flow: Optional[float] = None
     total_whale_volume: Optional[float] = None
     eth_price: Optional[float] = None
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "net_exchange_flow": -1250.5,
+                "total_whale_volume": 35465343.56,
+                "eth_price": 3235.73
+            }
+        }
 
 
 class PredictionResponse(BaseModel):
-    """Prediction response"""
     success: bool
-    date: str  # Date of whale data used
-    next_day_prediction: str  # "Up" or "Down" - prediction for NEXT day
+    date: str
+    next_day_prediction: str
     confidence: float
     probability_up: float
     probability_down: float
     key_metrics: Optional[KeyMetrics] = None
+    cached: bool = False
+    generated_at: Optional[str] = None
     
     class Config:
         json_schema_extra = {
             "example": {
                 "success": True,
-                "date": "2025-11-14",
+                "date": "2025-11-17",
                 "next_day_prediction": "Up",
                 "confidence": 0.78,
                 "probability_up": 0.78,
@@ -104,31 +156,43 @@ class PredictionResponse(BaseModel):
                     "net_exchange_flow": -1250.5,
                     "total_whale_volume": 35465343.56,
                     "eth_price": 3235.73
-                }
+                },
+                "cached": True,
+                "generated_at": "2025-11-17T10:30:00"
             }
         }
 
 
-class HistoricalPrediction(BaseModel):
-    """Historical prediction with date"""
-    date: str  # Date of whale data
-    next_day_prediction: str  # Prediction for the NEXT day
+class RefreshResponse(BaseModel):
+    success: bool
+    message: str
+    latest_date: Optional[str] = None
+    timestamp: str
+
+
+class AdminRefreshRequest(BaseModel):
+    force: bool = Field(False, description="Force refresh even if data is recent")
+
+class PredictionHistoryItem(BaseModel):
+    date: str
+    prediction: str
     confidence: float
     probability_up: float
     probability_down: float
     eth_price: Optional[float] = None
-
-
-class HistoricalResponse(BaseModel):
-    """Historical predictions response"""
+    
+class PredictionHistoryResponse(BaseModel):
     success: bool
-    predictions: List[HistoricalPrediction]
-    count: int
-    date_range: str
+    total_predictions: int
+    predictions: List[PredictionHistoryItem]
+    date_range: dict
 
+
+
+# ==================== CORE FUNCTIONS ====================
 
 def load_model():
-    """Load model at startup"""
+    """Load trained model"""
     global MODEL, SCALER, FEATURE_NAMES, MODEL_INFO
     
     print("🔄 Loading model...")
@@ -150,7 +214,6 @@ def load_model():
         }
         
         print(f"✅ Model loaded: {MODEL_INFO['model_name']}")
-        print(f"   Trained: {MODEL_INFO['trained_date']}")
         print(f"   Test Accuracy: {MODEL_INFO['test_accuracy']:.4f}")
         print(f"   Test Recall: {MODEL_INFO['test_recall']:.4f}")
         
@@ -165,7 +228,7 @@ def load_model():
 
 
 def load_data():
-    """Load whale data at startup"""
+    """Load whale data from CSV"""
     global DATA_DF
     
     print("🔄 Loading whale data...")
@@ -187,11 +250,28 @@ def load_data():
         
     except FileNotFoundError:
         print(f"❌ Data file not found: {DATA_FILE}")
-        print("   API will run but predictions won't be available")
         return False
     except Exception as e:
         print(f"❌ Error loading data: {e}")
         return False
+
+
+def load_cache():
+    """Load cached prediction if available"""
+    global CACHED_PREDICTION, LAST_UPDATE
+    
+    try:
+        if Path(CACHE_FILE).exists():
+            with open(CACHE_FILE, 'r') as f:
+                CACHED_PREDICTION = json.load(f)
+            
+            LAST_UPDATE = datetime.fromisoformat(CACHED_PREDICTION['generated_at'])
+            print(f"✅ Loaded cached prediction from {CACHED_PREDICTION['date']}")
+            return True
+    except Exception as e:
+        print(f"⚠️  Could not load cache: {e}")
+    
+    return False
 
 
 def prepare_features(df):
@@ -221,21 +301,142 @@ def get_key_metrics(row):
     return metrics
 
 
+def refresh_data_and_predict():
+    """
+    Main refresh function: Fetch new data and generate prediction
+    
+    This is called by the scheduler and can be triggered manually.
+    """
+    global DATA_DF, CACHED_PREDICTION, LAST_UPDATE
+    
+    print("\n" + "="*70)
+    print(" AUTOMATED DATA REFRESH ".center(70))
+    print("="*70)
+    print(f" Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    try:
+        # 1. Fetch and prepare fresh data
+        df_new = fetch_and_prepare_data(save_file=DATA_FILE)
+        
+        # 2. Update global DataFrame
+        DATA_DF = df_new
+        
+        # 3. Make prediction on latest data
+        latest_row = DATA_DF.iloc[[-1]]
+        date_str = DATA_DF['block_date'].iloc[-1].strftime('%Y-%m-%d')
+        
+        X_scaled = prepare_features(latest_row)
+        pred = MODEL.predict(X_scaled)[0]
+        proba = MODEL.predict_proba(X_scaled)[0]
+        
+        key_metrics = get_key_metrics(latest_row.iloc[0])
+        
+        # 4. Cache the prediction
+        prediction_data = {
+            "success": True,
+            "date": date_str,
+            "next_day_prediction": "Up" if pred == 1 else "Down",
+            "confidence": float(max(proba)),
+            "probability_up": float(proba[1]),
+            "probability_down": float(proba[0]),
+            "key_metrics": {
+                "net_exchange_flow": key_metrics.net_exchange_flow,
+                "total_whale_volume": key_metrics.total_whale_volume,
+                "eth_price": key_metrics.eth_price
+            },
+            "cached": True,
+            "generated_at": datetime.now().isoformat()
+        }
+        
+        CACHED_PREDICTION = prediction_data
+        LAST_UPDATE = datetime.now()
+        
+        # Save cache to file
+        with open(CACHE_FILE, 'w') as f:
+            json.dump(prediction_data, f, indent=2)
+        
+        print(f"\n✅ Prediction cached for {date_str}")
+        print(f"   Prediction: {prediction_data['next_day_prediction']}")
+        print(f"   Confidence: {prediction_data['confidence']:.2%}")
+        print(f"   Next update: Tomorrow at 00:30 UTC")
+        
+        return True
+        
+    except Exception as e:
+        print(f"\n❌ Data refresh failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def schedule_daily_refresh():
+    """Schedule daily data refresh at 00:30 UTC"""
+    scheduler = BackgroundScheduler()
+    
+    # Run every day at 00:30 UTC (after market closes and data is available)
+    scheduler.add_job(
+        refresh_data_and_predict,
+        trigger='cron',
+        hour=0,
+        minute=30,
+        id='daily_refresh'
+    )
+    
+    scheduler.start()
+    print("\n⏰ Scheduled daily refresh at 00:30 UTC")
+
+
+# ==================== STARTUP ====================
+
 @app.on_event("startup")
 async def startup_event():
-    """Load model and data when API starts"""
+    """Initialize on startup"""
+    print("\n" + "="*70)
+    print(" STARTING API SERVER ".center(70))
+    print("="*70)
+    
+    # Check if admin key is configured
+    if not ADMIN_API_KEY:
+        print("⚠️  ADMIN_API_KEY not set - refresh endpoint will be disabled")
+    else:
+        print("✅ Admin authentication configured")
+    
+    # Load model
     model_loaded = load_model()
+    if not model_loaded:
+        print("\n❌ Failed to load model. API will not function.")
+        return
+    
+    # Load existing data
     data_loaded = load_data()
     
-    if not model_loaded:
-        print("\n❌ Failed to load model. API will not function properly.")
-    if not data_loaded:
-        print("\n⚠️  Failed to load data. Predictions won't be available.")
+    # Load cached prediction
+    cache_loaded = load_cache()
+    
+    # Check if we need to refresh
+    if not cache_loaded or not data_loaded:
+        print("\n🔄 No cache found. Running initial data refresh...")
+        refresh_data_and_predict()
+    else:
+        # Check if cache is from today
+        cache_date = datetime.fromisoformat(CACHED_PREDICTION['generated_at']).date()
+        if cache_date < datetime.now().date():
+            print("\n🔄 Cache is stale. Refreshing data...")
+            refresh_data_and_predict()
+        else:
+            print(f"\n✅ Using cached prediction from {cache_date}")
+    
+    # Start scheduler
+    schedule_daily_refresh()
+    
+    print("\n✅ API ready!")
 
+
+# ==================== API ENDPOINTS ====================
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    """Home page with API documentation"""
+    """Home page"""
     if MODEL is None:
         model_status = "❌ Not loaded"
     else:
@@ -246,8 +447,12 @@ async def home():
         latest_date = "N/A"
     else:
         data_status = f"✅ {len(DATA_DF)} records"
-        latest_date = DATA_DF['block_date'].iloc[-1].strftime('%Y-%m-%d') if 'block_date' in DATA_DF.columns else "Unknown"
+        latest_date = DATA_DF['block_date'].iloc[-1].strftime('%Y-%m-%d')
     
+    cache_status = "✅ Available" if CACHED_PREDICTION else "❌ Not cached"
+    last_update_str = LAST_UPDATE.strftime('%Y-%m-%d %H:%M UTC') if LAST_UPDATE else "N/A"
+    admin_status = "✅ Configured" if ADMIN_API_KEY else "❌ Disabled"
+       
     docs = f"""
     <html>
     <head>
@@ -256,117 +461,234 @@ async def home():
             body {{ font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }}
             .container {{ background: white; padding: 30px; border-radius: 8px; max-width: 900px; margin: 0 auto; }}
             h1 {{ color: #2c3e50; }}
-            h2 {{ color: #34495e; border-bottom: 2px solid #3498db; padding-bottom: 10px; }}
-            code {{ background: #ecf0f1; padding: 2px 6px; border-radius: 3px; font-family: monospace; }}
-            pre {{ background: #2c3e50; color: #ecf0f1; padding: 15px; border-radius: 5px; overflow-x: auto; font-family: monospace; }}
-            .endpoint {{ background: #e8f5e9; padding: 15px; margin: 15px 0; border-radius: 5px; border-left: 4px solid #4caf50; }}
-            .method {{ display: inline-block; padding: 4px 8px; border-radius: 3px; font-weight: bold; margin-right: 10px; }}
-            .get {{ background: #61affe; color: white; }}
-            .status {{ padding: 10px; background: #fff3cd; border-radius: 5px; margin: 20px 0; }}
+            .status {{ padding: 15px; background: #d4edda; border-radius: 5px; margin: 20px 0; }}
+            .highlight {{ background: #fff3cd; border-left: 4px solid #ffc107; padding: 15px; margin: 20px 0; }}
             .docs-link {{ background: #007bff; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block; margin: 10px 5px; }}
             .docs-link:hover {{ background: #0056b3; }}
-            .highlight {{ background: #d4edda; border-left: 4px solid #28a745; padding: 15px; margin: 20px 0; }}
+            .refresh-btn {{ background: #28a745; }}
+            .refresh-btn:hover {{ background: #218838; }}
+            .admin-btn {{ background: #dc3545; }}
+            .admin-btn:hover {{ background: #c82333; }}
+            .admin-info {{ background: #e2e3e5; padding: 10px; border-radius: 5px; margin: 10px 0; }}
+            
+            /* Modal styles */
+            .modal {{
+                display: none;
+                position: fixed;
+                z-index: 1000;
+                left: 0;
+                top: 0;
+                width: 100%;
+                height: 100%;
+                background-color: rgba(0,0,0,0.4);
+            }}
+            .modal-content {{
+                background-color: #fefefe;
+                margin: 15% auto;
+                padding: 30px;
+                border-radius: 8px;
+                width: 400px;
+                box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            }}
+            .modal-header {{
+                margin-bottom: 20px;
+            }}
+            .modal-header h2 {{
+                margin: 0;
+                color: #2c3e50;
+            }}
+            .form-group {{
+                margin-bottom: 20px;
+            }}
+            .form-group label {{
+                display: block;
+                margin-bottom: 8px;
+                font-weight: bold;
+                color: #555;
+            }}
+            .form-group input {{
+                width: 100%;
+                padding: 10px;
+                border: 2px solid #ddd;
+                border-radius: 4px;
+                font-size: 14px;
+                box-sizing: border-box;
+            }}
+            .form-group input:focus {{
+                outline: none;
+                border-color: #007bff;
+            }}
+            .modal-buttons {{
+                display: flex;
+                gap: 10px;
+                justify-content: flex-end;
+            }}
+            .btn {{
+                padding: 10px 20px;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 14px;
+                font-weight: bold;
+            }}
+            .btn-primary {{
+                background-color: #dc3545;
+                color: white;
+            }}
+            .btn-primary:hover {{
+                background-color: #c82333;
+            }}
+            .btn-secondary {{
+                background-color: #6c757d;
+                color: white;
+            }}
+            .btn-secondary:hover {{
+                background-color: #5a6268;
+            }}
+            .close {{
+                color: #aaa;
+                float: right;
+                font-size: 28px;
+                font-weight: bold;
+                cursor: pointer;
+            }}
+            .close:hover {{
+                color: #000;
+            }}
         </style>
     </head>
     <body>
         <div class="container">
             <h1>🐋 ETH Whale Activity Price Predictor</h1>
+            <h3>🔄 Auto-Refresh Enabled | 🔐 Admin Protected</h3>
             
             <div class="status">
                 <strong>Model:</strong> {model_status}<br>
                 <strong>Data:</strong> {data_status}<br>
                 <strong>Latest Data:</strong> {latest_date}<br>
-                <strong>Server:</strong> Running on port 9696
+                <strong>Cached Prediction:</strong> {cache_status}<br>
+                <strong>Last Update:</strong> {last_update_str}<br>
+                <strong>Admin Auth:</strong> {admin_status}<br>
+                <strong>Next Auto-Update:</strong> Tomorrow at 00:30 UTC
             </div>
             
             <div class="highlight">
-                <strong>🎯 Main Endpoint:</strong> Predict TOMORROW's ETH price direction based on TODAY's whale activity<br>
-                <code>GET /predict/latest</code>
+                <strong>🎯 Get Latest Prediction:</strong><br>
+                <code>GET /predict/latest</code> - Instant cached result
             </div>
             
-            <div style="margin: 20px 0;">
-                <a href="/docs" class="docs-link">📖 Interactive API Docs</a>
-                <a href="/redoc" class="docs-link">📘 ReDoc</a>
+            <div class="admin-info">
+                <strong>🔐 Admin Access Required:</strong><br>
+                <code>/refresh</code> - Force data refresh (Requires Admin Key)
             </div>
             
-            <h2>📡 Endpoints</h2>
-            
-            <div class="endpoint">
-                <span class="method get">GET</span>
-                <strong>/health</strong><br>
-                Health check - verify API and data status
+            <div>
+                <a href="/docs" class="docs-link">📖 API Docs</a>
+                <a href="/predict/latest" class="docs-link">🔮 Get Prediction</a>
+                <a href="/predict/history" class="docs-link">📊 History</a>
+                <a href="/health" class="docs-link">❤️ Health Check</a>
+                <button onclick="showAdminModal()" class="docs-link admin-btn">🔄 Force Refresh (Admin)</button>
             </div>
             
-            <div class="endpoint">
-                <span class="method get">GET</span>
-                <strong>/model-info</strong><br>
-                Get model performance metrics
-            </div>
-            
-            <div class="endpoint">
-                <span class="method get">GET</span>
-                <strong>/predict/latest</strong><br>
-                🎯 <strong>Main endpoint:</strong> Predict TOMORROW's price direction using TODAY's latest whale data
-            </div>
-            
-            <div class="endpoint">
-                <span class="method get">GET</span>
-                <strong>/predict/date/{{date}}</strong><br>
-                Predict for a specific date (format: YYYY-MM-DD)
-            </div>
-            
-            <div class="endpoint">
-                <span class="method get">GET</span>
-                <strong>/predict/historical</strong><br>
-                Get predictions for the last N days (default: 7)
-            </div>
-            
-            <h2>📝 Example Usage</h2>
-            
-            <h3>Get Latest Prediction (Most Common)</h3>
-            <pre>curl http://localhost:9696/predict/latest</pre>
-            
-            <h3>Response Example</h3>
-            <pre>{{
-  "success": true,
-  "date": "2024-03-15",
-  "next_day_prediction": "Up",
-  "confidence": 0.78,
-  "probability_up": 0.78,
-  "probability_down": 0.22,
-  "key_metrics": {{
-    "net_exchange_flow": -1250.5,
-    "total_whale_volume": 8500.2,
-    "eth_price": 3245.67
-  }}
-}}</pre>
-            
-            <p><strong>Note:</strong> If today is March 15, this predicts March 16's price direction!</p>
-            
-            <h3>Predict for Specific Date</h3>
-            <pre>curl http://localhost:9696/predict/date/2024-03-10</pre>
-            
-            <h3>Get Last 30 Days of Predictions</h3>
-            <pre>curl "http://localhost:9696/predict/historical?days=30"</pre>
-            
-            <h2>💡 How It Works</h2>
+            <h2>🚀 Features</h2>
             <ul>
-                <li>📊 The API automatically loads whale activity data from the CSV file</li>
-                <li>🤖 The trained ML model analyzes 62 features from TODAY's whale behavior</li>
-                <li>🎯 It predicts whether ETH price will go UP or DOWN TOMORROW</li>
-                <li>📈 Confidence scores show how certain the model is about the prediction</li>
-                <li>⏰ The prediction is for the NEXT DAY based on CURRENT whale activity</li>
-            </ul>
-            
-            <h2>🔍 Understanding the Results</h2>
-            <ul>
-                <li><strong>Date:</strong> The date of whale data used (e.g., March 15)</li>
-                <li><strong>Next Day Prediction:</strong> "Up" or "Down" - predicted price direction for TOMORROW (e.g., March 16)</li>
-                <li><strong>Confidence:</strong> 0-1 scale (higher = more certain)</li>
-                <li><strong>Net Exchange Flow:</strong> Negative = whales withdrawing (bullish), Positive = whales depositing (bearish)</li>
-                <li><strong>Whale Volume:</strong> Total WETH moved by large holders</li>
+                <li>✅ Auto-refresh: Fetches latest data daily at 00:30 UTC</li>
+                <li>✅ Cached predictions: Instant results</li>
+                <li>✅ Prediction history: View past predictions</li>
+                <li>🔐 Admin refresh: Secure manual updates</li>
             </ul>
         </div>
+
+        <!-- Admin Modal -->
+        <div id="adminModal" class="modal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <span class="close" onclick="closeAdminModal()">&times;</span>
+                    <h2>🔐 Admin Authentication</h2>
+                </div>
+                <form onsubmit="submitRefresh(event)">
+                    <div class="form-group">
+                        <label for="adminKey">Admin API Key:</label>
+                        <input 
+                            type="password" 
+                            id="adminKey" 
+                            name="adminKey" 
+                            placeholder="Enter your admin key"
+                            required
+                            autocomplete="off"
+                        >
+                    </div>
+                    <div class="modal-buttons">
+                        <button type="button" class="btn btn-secondary" onclick="closeAdminModal()">Cancel</button>
+                        <button type="submit" class="btn btn-primary">🔄 Refresh Data</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+        
+        <script>
+            function showAdminModal() {{
+                document.getElementById('adminModal').style.display = 'block';
+                document.getElementById('adminKey').focus();
+            }}
+            
+            function closeAdminModal() {{
+                document.getElementById('adminModal').style.display = 'none';
+                document.getElementById('adminKey').value = '';
+            }}
+            
+            // Close modal when clicking outside
+            window.onclick = function(event) {{
+                const modal = document.getElementById('adminModal');
+                if (event.target == modal) {{
+                    closeAdminModal();
+                }}
+            }}
+            
+            // Close modal on Escape key
+            document.addEventListener('keydown', function(event) {{
+                if (event.key === 'Escape') {{
+                    closeAdminModal();
+                }}
+            }});
+            
+            function submitRefresh(event) {{
+                event.preventDefault();
+                
+                const adminKey = document.getElementById('adminKey').value;
+                const submitBtn = event.target.querySelector('.btn-primary');
+                
+                // Disable button and show loading
+                submitBtn.disabled = true;
+                submitBtn.textContent = '⏳ Refreshing...';
+                
+                fetch('/refresh', {{
+                    method: 'POST',
+                    headers: {{
+                        'X-Admin-Key': adminKey,
+                        'Content-Type': 'application/json'
+                    }}
+                }})
+                .then(response => {{
+                    if (!response.ok) {{
+                        return response.json().then(err => {{
+                            throw new Error(err.detail || 'Authentication failed');
+                        }});
+                    }}
+                    return response.json();
+                }})
+                .then(data => {{
+                    alert('✅ ' + data.message);
+                    closeAdminModal();
+                    setTimeout(() => location.reload(), 2000);
+                }})
+                .catch(error => {{
+                    alert('❌ Refresh failed: ' + error.message);
+                    submitBtn.disabled = false;
+                    submitBtn.textContent = '🔄 Refresh Data';
+                }});
+            }}
+        </script>
     </body>
     </html>
     """
@@ -375,15 +697,19 @@ async def home():
 
 @app.get("/health", response_model=HealthResponse)
 async def health():
-    """Health check endpoint"""
-    if MODEL is None or DATA_DF is None:
-        status_str = "degraded" if MODEL is not None or DATA_DF is not None else "unhealthy"
-    else:
-        status_str = "healthy"
+    """Health check"""
+    # FIX: Use 'is not None' instead of truthy check for DataFrame
+    status_str = "healthy" if (MODEL is not None and DATA_DF is not None) else "degraded"
     
     latest_date = None
     if DATA_DF is not None and 'block_date' in DATA_DF.columns:
         latest_date = DATA_DF['block_date'].iloc[-1].strftime('%Y-%m-%d')
+    
+    last_update_str = LAST_UPDATE.isoformat() if LAST_UPDATE else None
+    
+    # Next update at 00:30 UTC tomorrow
+    now = datetime.utcnow()
+    next_update = datetime(now.year, now.month, now.day, 0, 30) + timedelta(days=1)
     
     return HealthResponse(
         status=status_str,
@@ -392,9 +718,11 @@ async def health():
         features=MODEL_INFO['n_features'] if MODEL else None,
         data_loaded=DATA_DF is not None,
         latest_data_date=latest_date,
-        total_records=len(DATA_DF) if DATA_DF is not None else None
+        total_records=len(DATA_DF) if DATA_DF is not None else None,
+        last_update=last_update_str,
+        next_update=next_update.isoformat(),
+        cache_available=CACHED_PREDICTION is not None
     )
-
 
 @app.get("/model-info", response_model=ModelInfoResponse)
 async def model_info():
@@ -418,10 +746,10 @@ async def model_info():
 @app.get("/predict/latest", response_model=PredictionResponse)
 async def predict_latest():
     """
-    Predict TOMORROW's price direction based on TODAY's latest whale data
+    Get cached prediction (recommended)
     
-    Uses the most recent whale activity data to predict next-day price movement.
-    Example: If latest data is from March 15, this predicts March 16's direction.
+    Returns the cached prediction from the last data refresh.
+    Fast and resource-efficient.
     """
     if MODEL is None:
         raise HTTPException(
@@ -429,121 +757,58 @@ async def predict_latest():
             detail="Model not loaded"
         )
     
-    if DATA_DF is None:
+    if CACHED_PREDICTION is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Data not loaded"
+            detail="No prediction available. Try POST /refresh"
         )
     
-    try:
-        # Get latest row
-        latest_row = DATA_DF.iloc[[-1]]
-        
-        if 'block_date' in DATA_DF.columns:
-            date_str = DATA_DF['block_date'].iloc[-1].strftime('%Y-%m-%d')
-        else:
-            date_str = datetime.now().strftime('%Y-%m-%d')
-        
-        # Prepare and predict
-        X_scaled = prepare_features(latest_row)
-        pred = MODEL.predict(X_scaled)[0]
-        proba = MODEL.predict_proba(X_scaled)[0]
-        
-        # Extract key metrics
-        key_metrics = get_key_metrics(latest_row.iloc[0])
-        
-        return PredictionResponse(
-            success=True,
-            date=date_str,
-            next_day_prediction="Up" if pred == 1 else "Down",
-            confidence=float(max(proba)),
-            probability_up=float(proba[1]),
-            probability_down=float(proba[0]),
-            key_metrics=key_metrics
-        )
-    
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Prediction failed: {str(e)}"
-        )
+    return PredictionResponse(**CACHED_PREDICTION)
 
 
-@app.get("/predict/date/{date}", response_model=PredictionResponse)
-async def predict_date(date: str):
-    """
-    Predict for a specific date's whale data
-    
-    Date format: YYYY-MM-DD (e.g., 2024-03-15)
-    This predicts the NEXT day's direction based on the given date's whale activity.
-    Example: date=2024-03-15 predicts March 16's price direction.
-    """
-    if MODEL is None or DATA_DF is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Model or data not loaded"
-        )
-    
-    try:
-        target_date = pd.to_datetime(date)
-    except:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid date format. Use YYYY-MM-DD"
-        )
-    
-    # Find matching row
-    if 'block_date' not in DATA_DF.columns:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Date column not available in data"
-        )
-    
-    matching_rows = DATA_DF[DATA_DF['block_date'] == target_date]
-    
-    if len(matching_rows) == 0:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No data found for date {date}"
-        )
-    
-    try:
-        row = matching_rows.iloc[[-1]]
-        
-        # Prepare and predict
-        X_scaled = prepare_features(row)
-        pred = MODEL.predict(X_scaled)[0]
-        proba = MODEL.predict_proba(X_scaled)[0]
-        
-        # Extract key metrics
-        key_metrics = get_key_metrics(row.iloc[0])
-        
-        return PredictionResponse(
-            success=True,
-            date=date,
-            next_day_prediction="Up" if pred == 1 else "Down",
-            confidence=float(max(proba)),
-            probability_up=float(proba[1]),
-            probability_down=float(proba[0]),
-            key_metrics=key_metrics
-        )
-    
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Prediction failed: {str(e)}"
-        )
-
-
-@app.get("/predict/historical", response_model=HistoricalResponse)
-async def predict_historical(
-    days: int = Query(default=7, ge=1, le=365, description="Number of days to predict")
+@app.post("/refresh", response_model=RefreshResponse)
+async def manual_refresh(
+    background_tasks: BackgroundTasks,
+    admin_authenticated: bool = Depends(verify_admin_key)
 ):
     """
-    Get next-day predictions for the last N days
+    🔐 ADMIN: Manually trigger data refresh
     
-    Returns predictions for the most recent days in the dataset.
-    Each prediction shows what was predicted for the NEXT day based on that day's whale data.
+    Fetches fresh data from Dune and CoinGecko, then generates new prediction.
+    Requires admin authentication via X-Admin-Key header.
+    
+    Headers:
+        X-Admin-Key: Your admin API key
+    """
+    if MODEL is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Model not loaded"
+        )
+    
+    print(f"\n🔐 ADMIN: Manual refresh triggered at {datetime.now().isoformat()}")
+    
+    # Run refresh in background
+    background_tasks.add_task(refresh_data_and_predict)
+    
+    return RefreshResponse(
+        success=True,
+        message="Admin data refresh triggered. Check /predict/latest in 1-2 minutes.",
+        latest_date=DATA_DF['block_date'].iloc[-1].strftime('%Y-%m-%d') if DATA_DF is not None else None,
+        timestamp=datetime.now().isoformat()
+    )
+
+@app.get("/predict/history", response_model=PredictionHistoryResponse)
+async def prediction_history(limit: int = 30, days: int = 30):
+    """
+    Get historical predictions
+    
+    Args:
+        limit: Maximum number of predictions to return (default: 30)
+        days: Number of days to look back (default: 30)
+    
+    Returns:
+        Historical predictions with dates and confidence scores
     """
     if MODEL is None or DATA_DF is None:
         raise HTTPException(
@@ -552,58 +817,59 @@ async def predict_historical(
         )
     
     try:
-        # Get last N rows
-        last_rows = DATA_DF.iloc[-days:]
+        # Get last N days of data
+        cutoff_date = datetime.now() - timedelta(days=days)
         
-        # Prepare and predict
-        X_scaled = prepare_features(last_rows)
+        # Filter data
+        if 'block_date' in DATA_DF.columns:
+            recent_df = DATA_DF[DATA_DF['block_date'] >= cutoff_date].copy()
+        else:
+            recent_df = DATA_DF.tail(limit).copy()
+        
+        # Limit results
+        recent_df = recent_df.tail(limit)
+        
+        # Make predictions for historical data
+        X_scaled = prepare_features(recent_df)
         predictions = MODEL.predict(X_scaled)
         probabilities = MODEL.predict_proba(X_scaled)
         
-        # Build response
-        results = []
-        for i, (pred, proba) in enumerate(zip(predictions, probabilities)):
-            row = last_rows.iloc[i]
+        # Build history list
+        history = []
+        for idx, (_, row) in enumerate(recent_df.iterrows()):
+            pred = predictions[idx]
+            proba = probabilities[idx]
             
-            if 'block_date' in last_rows.columns:
-                date_str = pd.to_datetime(row['block_date']).strftime('%Y-%m-%d')
-            else:
-                date_str = f"Row {i}"
-            
+            date_str = row['block_date'].strftime('%Y-%m-%d') if 'block_date' in row else f"Record {idx}"
             eth_price = float(row['eth_price']) if 'eth_price' in row else None
             
-            results.append(
-                HistoricalPrediction(
-                    date=date_str,
-                    next_day_prediction="Up" if pred == 1 else "Down",
-                    confidence=float(max(proba)),
-                    probability_up=float(proba[1]),
-                    probability_down=float(proba[0]),
-                    eth_price=eth_price
-                )
-            )
+            history.append(PredictionHistoryItem(
+                date=date_str,
+                prediction="Up" if pred == 1 else "Down",
+                confidence=float(max(proba)),
+                probability_up=float(proba[1]),
+                probability_down=float(proba[0]),
+                eth_price=eth_price
+            ))
         
-        # Date range
-        if 'block_date' in last_rows.columns:
-            start_date = last_rows['block_date'].iloc[0].strftime('%Y-%m-%d')
-            end_date = last_rows['block_date'].iloc[-1].strftime('%Y-%m-%d')
-            date_range = f"{start_date} to {end_date}"
-        else:
-            date_range = f"Last {len(results)} rows"
+        # Date range info
+        date_range = {
+            "start": history[0].date if history else None,
+            "end": history[-1].date if history else None
+        }
         
-        return HistoricalResponse(
+        return PredictionHistoryResponse(
             success=True,
-            predictions=results,
-            count=len(results),
+            total_predictions=len(history),
+            predictions=history,
             date_range=date_range
         )
-    
+        
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Prediction failed: {str(e)}"
+            detail=f"Failed to generate history: {str(e)}"
         )
-
 
 if __name__ == '__main__':
     import uvicorn
@@ -614,6 +880,11 @@ if __name__ == '__main__':
     print(f"\n🚀 Server: http://localhost:9696")
     print(f"📖 API Docs: http://localhost:9696/docs")
     print(f"🎯 Main Endpoint: http://localhost:9696/predict/latest")
+    print(f"🔐 Admin Refresh: POST http://localhost:9696/refresh (with X-Admin-Key header)")
+    
+    if not ADMIN_API_KEY:
+        print("⚠️  WARNING: ADMIN_API_KEY not set - refresh endpoint disabled")
+    
     print(f"\n💡 Press Ctrl+C to stop\n")
     
     uvicorn.run(app, host="0.0.0.0", port=9696)

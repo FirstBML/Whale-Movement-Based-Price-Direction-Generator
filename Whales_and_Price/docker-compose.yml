@@ -1,28 +1,15 @@
-version: '3.8'
-
 services:
   eth-predictor:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    build: .
     container_name: eth-whale-predictor
     ports:
       - "9696:9696"
     environment:
+      - DUNE_WHALES_API=D1Smlg20H9BwjVTPpN8kGjdg2MZyIvuM
+      - COINGECKO_API_KEY=CG-nm5ynnbGBWTugQhVY2vNMWbP
+      - ADMIN_API_KEY=ML-WhalesMoves82m1960
       - PYTHONUNBUFFERED=1
     volumes:
-      - ./models:/app/models:ro
-      - ./whale_prices_ml_ready.csv:/app/whale_prices_ml_ready.csv:ro
+      - ./prediction_cache.json:/app/prediction_cache.json
+      - ./whale_prices_ml_ready.csv:/app/whale_prices_ml_ready.csv
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:9696/health')"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
-    networks:
-      - predictor-network
-
-networks:
-  predictor-network:
-    driver: bridge
