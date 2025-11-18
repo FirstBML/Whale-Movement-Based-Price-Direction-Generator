@@ -7,7 +7,7 @@ services:
     environment:
       - DUNE_WHALES_API=D1Smlg20H9BwjVTPpN8kGjdg2MZyIvuM
       - COINGECKO_API_KEY=CG-nm5ynnbGBWTugQhVY2vNMWbP
-      - ADMIN_API_KEY=ML-WhalesMoves82m1960
+      - ADMIN_API_KEY=ML-WhalesMoves82m1960#
       - PYTHONUNBUFFERED=1
     volumes:
       - ./prediction_cache.json:/app/prediction_cache.json
